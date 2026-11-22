@@ -1,0 +1,25 @@
+.venv/
+__pycache__/
+*.egg-info/
+.pytest_cache/
+# Ne jamais versionner un export de mots de passe
+*.csv
+
+.coverage
+htmlcov/
+build/
+dist/
+
+.env
+.env.*
+*.json
+*.json5
+*.jsonl
+*.gpg
+*.key
+*.pem
+*.p12
+*.pfx
+*.log
+
+samples/*.html
