@@ -1,4 +1,4 @@
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 import re
 from types import TracebackType
 
@@ -73,6 +73,79 @@ class CalendarClient:
         if not isinstance(payload, dict) or payload.get("id") != event_id:
             raise ValueError("La réponse Google ne correspond pas à l'événement demandé.")
         return payload
+
+    def list_events(self, start: datetime, end: datetime) -> list[dict[str, object]]:
+        """Liste toutes les occurrences chevauchant l'intervalle, avec pagination."""
+        events = []
+        token = None
+        seen_tokens = set()
+        while True:
+            response = self._service.events().list(
+                calendarId=self._calendar_id,
+                timeMin=start.isoformat(),
+                timeMax=end.isoformat(),
+                singleEvents=True,
+                showDeleted=False,
+                maxResults=2500,
+                pageToken=token,
+            ).execute()
+            if not isinstance(response, dict):
+                raise ValueError("La liste des événements Google est invalide.")
+            items = response.get("items")
+            if items is None and "items" not in response and response.get("kind") == "calendar#events":
+                items = []
+            if not isinstance(items, list):
+                raise ValueError("La liste des événements Google est invalide.")
+            if not all(isinstance(item, dict) for item in items):
+                raise ValueError("La liste des événements Google contient un événement invalide.")
+            events.extend(items)
+            token = response.get("nextPageToken")
+            if token is None:
+                return events
+            if not isinstance(token, str) or not token or token in seen_tokens:
+                raise ValueError("Le jeton de pagination Google est invalide ou dupliqué.")
+            seen_tokens.add(token)
+
+    def create_intervention_event(
+        self,
+        source_id: str,
+        summary: str,
+        start: datetime,
+        end: datetime,
+        *,
+        description: str = "",
+    ) -> dict[str, object]:
+        """Crée un événement avec un identifiant Google indépendant de l'ID Ximi."""
+        if re.fullmatch(r"[0-9]+", source_id) is None:
+            raise ValueError("L'identifiant de prestation doit être numérique.")
+        if (
+            not summary.strip()
+            or start.utcoffset() is None
+            or end.utcoffset() is None
+            or end.astimezone(timezone.utc) <= start.astimezone(timezone.utc)
+        ):
+            raise ValueError("Le titre et les horaires de l'événement sont invalides.")
+        payload = self._service.events().insert(
+            calendarId=self._calendar_id,
+            body={
+                "summary": summary,
+                "description": description,
+                "start": {"dateTime": start.isoformat(), "timeZone": "Europe/Paris"},
+                "end": {"dateTime": end.isoformat(), "timeZone": "Europe/Paris"},
+                "extendedProperties": {"private": {"planningAuxSourceId": source_id}},
+            },
+        ).execute()
+        if not isinstance(payload, dict) or not isinstance(payload.get("id"), str) or not payload["id"]:
+            raise ValueError("La réponse Google ne contient pas l'identifiant de l'événement créé.")
+        return payload
+
+    def delete_event(self, event_id: str, etag: str) -> None:
+        """Supprime l'événement seulement s'il n'a pas changé depuis sa lecture."""
+        if not event_id or not etag:
+            raise ValueError("L'identifiant et la version de l'événement sont obligatoires.")
+        request = self._service.events().delete(calendarId=self._calendar_id, eventId=event_id)
+        request.headers["If-Match"] = etag
+        request.execute()
 
     def upsert_intervention_event(
         self,

@@ -10,7 +10,7 @@ l'extranet Ximi (Xelya, « Familles Services ») et les enregistre dans Google C
 | 1 | Récupération du mot de passe (`pass`) | ✅ Fait |
 | 2 | Authentification sur le SSO Xelya | Implémentée, validation réelle à faire |
 | 3 | Scraping du planning | Implémenté, tests sur données synthétiques |
-| 4 | Écriture dans Google Calendar | Création et mise à jour des prestations implémentées |
+| 4 | Écriture dans Google Calendar | Réactualisation mensuelle implémentée |
 | 5 | Orchestration / exécution planifiée | CLI implémentée |
 
 Contraintes :
@@ -302,12 +302,11 @@ Le client ferme la ressource Google à la sortie du bloc. Les méthodes utilisen
 Les erreurs de `pass`, d'authentification et `googleapiclient.errors.HttpError`
 sont propagées ; une réponse inattendue lève
 `ValueError`. Les événements sur une journée utilisent une date de fin exclusive.
-`upsert_intervention_event` crée ou met à jour un événement horaire à partir de
-l'identifiant source Ximi. L'identifiant Google est déterministe et stocké aussi
-dans les propriétés privées de l'événement ; une nouvelle synchronisation met à
-jour l'événement existant au lieu de créer un doublon. Une collision non reconnue
-ne remplace pas un événement étranger. Les dates sont envoyées avec le fuseau
-`Europe/Paris`.
+La CLI utilise `list_events`, `create_intervention_event` et `delete_event` pour
+comparer et réactualiser les événements. L'ID Ximi est conservé dans les
+propriétés privées des nouveaux événements, mais n'est pas un critère d'égalité.
+Les dates sont envoyées avec le fuseau `Europe/Paris`. La suppression utilise
+`If-Match` avec l'ETag lu afin de refuser un événement modifié entre-temps.
 
 ### Ligne de commande et synchronisation
 
@@ -321,16 +320,25 @@ Après installation éditable, lancer :
 
 Sans `--month`, la commande choisit le mois courant en `Europe/Paris`. Le login
 est lu depuis `pass` (`Service/FamilleService/login`) et le mot de passe depuis
-`Service/FamilleService`. L'agenda par défaut est l'agenda de groupe utilisé
-pour le test ; `--calendar-id` permet de le remplacer. Dans cet environnement,
+`Service/FamilleService`. L'agenda par défaut est lu dans
+`AuxiliaireDeViePlanning/calendar_id` ; `--calendar-id` permet de le remplacer. Dans cet environnement,
 la commande est invoquée via `.venv/bin/planning-aux` car le dossier virtuel
 n'est pas ajouté automatiquement au `PATH`.
 
 Les rendez-vous sont créés aux heures locales du planning, avec fin calculée par
 la durée. Le titre est `Prestation — <intervenant>` ; une doublure ajoute
 `— Doublure`. Une prestation non attribuée devient `Prestation à pourvoir`.
-Cette synchronisation ne supprime pas les événements Google absents du mois
-source ; elle crée ou met à jour uniquement les prestations récupérées.
+La comparaison porte sur la date, l'heure de début, la durée et l'intervenant,
+sans tenir compte de l'ID source ni du marqueur de doublure. Un événement
+identique reste inchangé, une prestation manquante est créée et un événement
+absent est supprimé, y compris s'il a été créé manuellement. L'agenda doit donc
+être réservé à Famille Services. Le mois est déterminé par le début en
+`Europe/Paris` et les événements récurrents sont développés en occurrences.
+Les titres Google doivent respecter le format décrit ci-dessus ; les événements
+sur une journée et les titres non reconnus interrompent la synchronisation.
+Les doublons identiques et les données inattendues interrompent aussi le
+traitement avant toute écriture. Les créations précèdent les suppressions ; une
+erreur pendant les écritures peut nécessiter une nouvelle synchronisation.
 
 ### Informations inconnues et journal
 
@@ -350,18 +358,16 @@ environnement sans interface graphique, le même message est envoyé sur stderr.
 
 ### Validation Google Calendar
 
-Les tests automatisés couvrent la lecture de la clé privée multiligne, la
-création/relecture d'événements, la mise à jour idempotente, les mois, les formats
-inconnus, le journal et l'interface CLI. La suite complète de tests inclut des scénarios simulés pour la lecture des
-identifiants, la création/relecture et la mise à jour idempotente des événements,
-les mois, les formats inconnus, le journal et l'interface CLI. Les tests ne
+Les tests automatisés couvrent la lecture des identifiants, la pagination,
+la comparaison des événements, la création et la suppression conditionnelle,
+les doublons, les erreurs, le journal et l'interface CLI. Les tests ne
 nécessitent aucun accès réel à Google Calendar.
 
 ## Étape 5 — Orchestration
 
 L'orchestration synchrone est réalisée par `planning-aux` (`src/planning_aux/cli.py`).
-Elle récupère le planning du mois demandé, vérifie toutes ses lignes, puis crée ou
-met à jour les événements correspondants dans Google Calendar. Les codes de
+Elle récupère le planning et les événements du mois demandé, les vérifie, puis
+crée ou supprime les événements nécessaires dans Google Calendar. Les codes de
 sortie sont `0` en succès, `1` en erreur technique et `2` lorsqu'une information
 de planning inconnue nécessite une analyse. La planification périodique
 (cron/systemd) reste à configurer. L'identifiant de l'agenda est lu depuis

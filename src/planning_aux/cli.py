@@ -1,5 +1,5 @@
 import argparse
-from datetime import datetime
+from datetime import datetime, timezone
 import logging
 import os
 from pathlib import Path
@@ -52,7 +52,7 @@ def _configure_logging(path: Path) -> logging.Logger:
 
 def _notify_unknown_info(log_path: Path) -> None:
     message = (
-        "Une information inconnue du planning a été détectée.\n"
+        "Une information inconnue du planning ou de l'agenda a été détectée.\n"
         f"Consultez le fichier de log :\n{log_path}"
     )
     try:
@@ -79,6 +79,100 @@ def _event_summary(intervention: Intervention) -> str:
     if intervention.doublure:
         title += " — Doublure"
     return title
+
+
+def _month_bounds(month: str) -> tuple[datetime, datetime]:
+    year, number = map(int, month.split("-"))
+    start = datetime(year, number, 1, tzinfo=TIME_ZONE)
+    if number == 12:
+        end = datetime(year + 1, 1, 1, tzinfo=TIME_ZONE)
+    else:
+        end = datetime(year, number + 1, 1, tzinfo=TIME_ZONE)
+    return start, end
+
+
+def _google_datetime(value: object) -> datetime:
+    if not isinstance(value, dict) or not isinstance(value.get("dateTime"), str):
+        raise UnknownPlanningInfo("Date ou horaire Google non reconnu (événement sur une journée ?).")
+    try:
+        result = datetime.fromisoformat(value["dateTime"].replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise UnknownPlanningInfo("Date ou horaire Google invalide.") from exc
+    if result.utcoffset() is None:
+        raise UnknownPlanningInfo("Fuseau horaire absent d'un événement Google.")
+    return result
+
+
+def _google_intervenant(summary: object) -> str | None:
+    if summary == "Prestation à pourvoir" or summary == "Prestation à pourvoir — Doublure":
+        return None
+    if not isinstance(summary, str) or not summary.startswith("Prestation — "):
+        raise UnknownPlanningInfo(f"Titre d'événement Google non reconnu : {summary!r}.")
+    name = summary.removeprefix("Prestation — ").removesuffix(" — Doublure")
+    if not name or name != name.strip():
+        raise UnknownPlanningInfo(f"Intervenant Google non reconnu : {summary!r}.")
+    return name
+
+
+def _refresh(calendar: CalendarClient, interventions: list[Intervention], month: str) -> tuple[int, int, int]:
+    start, end = _month_bounds(month)
+    expected = {}
+    for intervention in interventions:
+        local_start = intervention.debut.replace(tzinfo=TIME_ZONE)
+        utc_start = local_start.astimezone(timezone.utc)
+        if utc_start.astimezone(TIME_ZONE).replace(tzinfo=None) != intervention.debut:
+            raise UnknownPlanningInfo("Horaire Famille Services inexistant dans le fuseau Europe/Paris.")
+        alternate = local_start.replace(fold=1).astimezone(timezone.utc)
+        if alternate != utc_start and alternate.astimezone(TIME_ZONE).replace(tzinfo=None) == intervention.debut:
+            raise UnknownPlanningInfo("Horaire Famille Services ambigu dans le fuseau Europe/Paris.")
+        if not start <= local_start < end or intervention.duree.total_seconds() <= 0:
+            raise UnknownPlanningInfo("Date hors du mois demandé ou durée invalide dans le planning.")
+        key = (utc_start, utc_start + intervention.duree, intervention.intervenant)
+        if key in expected:
+            raise UnknownPlanningInfo("Prestations Famille Services identiques en double.")
+        expected[key] = intervention
+
+    actual = {}
+    seen_ids = set()
+    for event in calendar.list_events(start, end):
+        google_start = _google_datetime(event.get("start"))
+        if not start <= google_start.astimezone(TIME_ZONE) < end:
+            continue
+        google_end = _google_datetime(event.get("end"))
+        event_id, etag = event.get("id"), event.get("etag")
+        if not isinstance(event_id, str) or not event_id or not isinstance(etag, str) or not etag:
+            raise UnknownPlanningInfo("Identifiant ou version d'un événement Google absent.")
+        if event_id in seen_ids:
+            raise UnknownPlanningInfo("Identifiant d'événement Google dupliqué.")
+        seen_ids.add(event_id)
+        key = (
+            google_start.astimezone(timezone.utc),
+            google_end.astimezone(timezone.utc),
+            _google_intervenant(event.get("summary")),
+        )
+        if key[1] <= key[0]:
+            raise UnknownPlanningInfo("Durée d'un événement Google invalide.")
+        if key in actual:
+            raise UnknownPlanningInfo("Événements Google identiques en double.")
+        actual[key] = (event_id, etag)
+
+    missing = expected.keys() - actual.keys()
+    obsolete = actual.keys() - expected.keys()
+    for key in expected:
+        if key not in missing:
+            continue
+        intervention = expected[key]
+        calendar.create_intervention_event(
+            intervention.source_id,
+            _event_summary(intervention),
+            key[0].astimezone(TIME_ZONE),
+            key[1].astimezone(TIME_ZONE),
+            description="Doublure" if intervention.doublure else "",
+        )
+    for key in actual:
+        if key in obsolete:
+            calendar.delete_event(*actual[key])
+    return len(missing), len(obsolete), len(expected) - len(missing)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -121,26 +215,8 @@ def main(argv: list[str] | None = None) -> int:
         if not calendar_id.strip():
             raise ValueError(f"L'identifiant d'agenda {CALENDAR_ID_ENTRY} est vide.")
         interventions = get_interventions(login, month=args.month)
-        created = 0
-        updated = 0
         with CalendarClient(calendar_id) as calendar:
-            for intervention in interventions:
-                start = intervention.debut.replace(tzinfo=TIME_ZONE)
-                end = start + intervention.duree
-                description = "Doublure" if intervention.doublure else ""
-                action, _ = calendar.upsert_intervention_event(
-                    intervention.source_id,
-                    _event_summary(intervention),
-                    start,
-                    end,
-                    description=description,
-                )
-                if action == "created":
-                    created += 1
-                elif action == "updated":
-                    updated += 1
-                else:
-                    raise ValueError("Le client Google a retourné une action inconnue.")
+            created, deleted, unchanged = _refresh(calendar, interventions, args.month)
     except UnknownPlanningInfo as exc:
         logger.error("Information inconnue détectée : %s", exc)
         _notify_unknown_info(log_path)
@@ -160,12 +236,12 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     logger.info(
-        "Synchronisation %s terminée : %d prestations, %d créées, %d mises à jour.",
-        args.month, len(interventions), created, updated,
+        "Synchronisation %s terminée : %d prestations, %d créées, %d supprimées, %d inchangées.",
+        args.month, len(interventions), created, deleted, unchanged,
     )
     print(
         f"Mois {args.month} synchronisé : {len(interventions)} prestations, "
-        f"{created} créées, {updated} mises à jour."
+        f"{created} créées, {deleted} supprimées, {unchanged} inchangées."
     )
     return 0
 

@@ -2,7 +2,7 @@
 
 Synchronise les prestations de Famille Services (Ximi/Xelya) avec un agenda
 Google Calendar. La commande récupère le planning mensuel, vérifie son format,
-puis crée ou met à jour les événements correspondants.
+puis compare les événements et les réactualise dans l'agenda.
 
 ## Prérequis
 
@@ -50,20 +50,15 @@ Le compte de service doit avoir le droit de modifier les événements de cet
 agenda. L'identifiant peut aussi être passé avec `--calendar-id`.
 
 Pour Google Calendar, importer depuis le JSON du compte de service les champs
-suivants sous `AuxiliaireDeViePlanning/<nom-du-champ>` :
+utilisés sous `AuxiliaireDeViePlanning/<nom-du-champ>` :
 
 ```text
 type
-project_id
 private_key_id
 private_key
 client_email
 client_id
-auth_uri
 token_uri
-auth_provider_x509_cert_url
-client_x509_cert_url
-universe_domain
 ```
 
 Chaque entrée contient la valeur correspondante ; `private_key` peut être
@@ -101,16 +96,33 @@ Sans `--calendar-id`, l'identifiant est lu depuis
 Les rendez-vous sont créés aux heures du planning dans le fuseau
 `Europe/Paris`. Le titre contient l'intervenant ; les prestations de doublure
 sont marquées « Doublure ». Une prestation sans intervenant est affichée comme
-« Prestation à pourvoir ». Les événements sont identifiés par l'ID source Ximi :
-les synchronisations suivantes mettent à jour les événements existants au lieu
-de les dupliquer. Les événements absents du planning ne sont pas supprimés.
+« Prestation à pourvoir ».
+
+La réactualisation compare la date, l'heure, la durée et l'intervenant : un
+rendez-vous identique reste inchangé, un rendez-vous manquant est créé et un
+rendez-vous absent du planning est supprimé. Un changement de créneau ou
+d'intervenant entraîne donc une création et une suppression. Le marqueur
+« Doublure » et l'identifiant Ximi ne font pas partie des critères d'égalité.
+
+**L'agenda doit être réservé à Famille Services** : les rendez-vous du mois
+absents du planning sont supprimés même s'ils ont été créés manuellement. Le
+mois d'un rendez-vous est celui de son début en `Europe/Paris`. Les occurrences
+récurrentes sont comparées individuellement.
+
+Les rendez-vous Google doivent utiliser le format de titre décrit ci-dessus et
+avoir des horaires précis. Si un titre ou un horaire ne peut pas être
+interprété, ou si deux rendez-vous identiques sont trouvés d'un côté ou de
+l'autre, la synchronisation s'arrête sans modification. Toutes les créations
+sont effectuées avant les suppressions ; une erreur pendant les écritures peut
+laisser une synchronisation partielle, à relancer après correction. La
+suppression est refusée par Google si l'événement a changé depuis sa lecture.
 
 ## Formats inattendus et journal
 
-Si une information du site n'est pas reconnue (structure du tableau, date,
-durée, identifiant de prestation ou nouveau produit), la synchronisation
-s'arrête avant toute écriture dans Google Calendar. Le diagnostic est écrit
-dans :
+Si une information du site ou de l'agenda n'est pas reconnue (par exemple,
+structure du tableau, date, durée, identifiant de prestation, produit ou titre),
+la synchronisation s'arrête avant toute écriture dans Google Calendar. Le
+diagnostic est écrit dans :
 
 ```text
 ~/.local/state/planning-aux/planning_aux.log
@@ -129,6 +141,13 @@ permissions privées.
 Les tests utilisent des réponses HTTP simulées et des données synthétiques ;
 ils n'effectuent pas de connexion à Famille Services ni d'écriture dans Google
 Calendar.
+
+## Documentation technique
+
+Le [guide d'implémentation](docs/implementation.md) décrit les composants, la
+connexion, l'analyse du planning et l'algorithme de réactualisation. Le
+[document de conception](docs/conception.md) conserve les choix et les étapes
+du projet.
 
 ## Données privées
 
